@@ -18,7 +18,6 @@ from enum import Enum
 import math
 import numpy
 
-from enum import Enum
 
 class Gesture(Enum):
     NONE = 0
