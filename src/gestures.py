@@ -16,7 +16,7 @@ Il dit juste "c'est un clic", il ne clique pas lui-même.
 
 from enum import Enum
 import math
-import numpy
+
 
 
 class Gesture(Enum):
