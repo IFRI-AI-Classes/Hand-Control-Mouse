@@ -1,22 +1,23 @@
 """
-Ce fichier regarde la forme de la main et décide quel geste c'est
-(par exemple : doigts pincés = clic).
+Ce fichier regarde la forme de la main et décide quel geste c'est.
 Il dit juste "c'est un clic", il ne clique pas lui-même.
+
+Tous les gestes sont basés sur le COMPTAGE DE DOIGTS TENDUS/REPLIÉS
+(aucun pincement/distance entre doigts, trop fragile en 2D) :
+
+| Geste            | Doigts tendus (les autres repliés) |
+|------------------|-------------------------------------|
+| Déplacement      | Index seul                          |
+| Scroll           | Index + Majeur (en V)               |
+| Clic gauche      | Pouce seul                          |
+| Clic droit       | Auriculaire seul                    |
+| Double-clic      | Pouce + Auriculaire                 |
+| Drag (glisser)   | Majeur seul                         |
 """
 
-# C'est supposé que les landmarks seront chargées depuis le fichier detection 
-
-# Déjà le curseur est piloté par le bout de l'index (Landmark 8)
-
-# Clic gauche sera le toucher entre l'index et le pouce
-
-# Clic droit sera le toucher entre le pouce et le majeur
-
-# Scroll piloté par le majeur et l'index. De base c'est le mode normal. Le système entre en mode scroll uniquement si l'index et le majeur sont levés et que les autres doigts sont repliés
-
 from enum import Enum
-import math
-
+import time
+import numpy as np
 
 
 class Gesture(Enum):
@@ -26,141 +27,252 @@ class Gesture(Enum):
     SCROLL_UP = 3
     SCROLL_DOWN = 4
     DRAG = 5
+    DOUBLE_CLICK = 6
+
+
+# Indices des landmarks MediaPipe utilisés ici
+WRIST = 0
+THUMB_IP = 3
+THUMB_TIP = 4
+INDEX_PIP = 6
+INDEX_TIP = 8
+MIDDLE_MCP = 9
+MIDDLE_PIP = 10
+MIDDLE_TIP = 12
+RING_PIP = 14
+RING_TIP = 16
+PINKY_PIP = 18
+PINKY_TIP = 20
+
+# Nombre de frames consécutives où une posture doit être détectée avant
+# d'être validée. Filtre le bruit/tremblement de la détection (une seule
+# frame "limite" ne suffit plus à déclencher un geste).
+CONFIRM_FRAMES = 3
+
+# Le drag exige une confirmation un peu plus longue que les clics : ça
+# laisse le temps à la posture de la main de bien se stabiliser en
+# passant d'une main neutre à "majeur seul tendu", plutôt que de capter
+# une configuration intermédiaire qui ressemble à un autre geste.
+DRAG_CONFIRM_FRAMES = 6
+
+# Si un clic (simple, droit ou double) vient de se déclencher, on bloque
+# le démarrage d'un drag pendant ce délai : un vrai drag part d'une main
+# neutre, pas juste après un clic - ça évite qu'un double-clic parasite,
+# capté pendant la transition vers la posture drag, n'ouvre le fichier/
+# dossier juste avant que le drag ne prenne le relais.
+DRAG_SUPPRESS_AFTER_CLICK = 0.4
+
+# Vitesse de scroll, façon "manette/joystick" (voir _recognize_scroll)
+SCROLL_BASE_SPEED = 4        # vitesse minimale, main immobile sur le point de référence
+SCROLL_MAX_SPEED = 30        # vitesse plafond
+SCROLL_DISTANCE_GAIN = 250   # sensibilité : distance au point de référence -> vitesse
+SCROLL_SMOOTHING = 0.3       # lissage (0-1) : plus haut = plus réactif, plus bas = plus doux
+
 
 class GestureRecognizer:
-    def __init__(self , click_threshold = 0.04, scroll_threshold = 0.02 ):
-        
-        # Sensibilité du click
-        self.click_threshold = click_threshold
-        
-        # Position précédente du majeur
-        self.previous_middle_y = None
-        
-        # Sensibilité du scroll
-        self.scroll_threshold = scroll_threshold
-    
-    def distance(self, point1, point2):
+    def __init__(self):
+        # État du "joystick" de scroll : point de référence et vitesse lissée
+        self._scroll_anchor_y = None
+        self._scroll_speed_smooth = SCROLL_BASE_SPEED
+
+        # Compteurs de confirmation (anti-bruit) pour chaque geste "one-shot"
+        self._left_streak = 0
+        self._right_streak = 0
+        self._double_streak = 0
+        self._drag_streak = 0
+
+        # Empêche un clic de se répéter tant que la posture reste tenue :
+        # il faut relâcher avant de pouvoir redéclencher.
+        self._left_armed = True
+        self._right_armed = True
+        self._double_armed = True
+
+        # Horodatage du dernier clic déclenché, pour bloquer temporairement
+        # le drag juste après (voir DRAG_SUPPRESS_AFTER_CLICK).
+        self._last_click_time = 0.0
+
+    def reset(self):
+        """À appeler quand la main disparaît de l'image, pour ne pas
+        comparer avec une ancienne position au retour de la main."""
+        self._scroll_anchor_y = None
+        self._scroll_speed_smooth = SCROLL_BASE_SPEED
+        self._left_streak = 0
+        self._right_streak = 0
+        self._double_streak = 0
+        self._drag_streak = 0
+        self._left_armed = True
+        self._right_armed = True
+        self._double_armed = True
+        self._last_click_time = 0.0
+
+    def _to_points(self, landmarks):
+        return np.array([(lm.x, lm.y) for lm in landmarks])
+
+    def _hand_scale(self, points):
+        """Taille de référence de la main (poignet -> base du majeur)."""
+        return float(np.linalg.norm(points[MIDDLE_MCP] - points[WRIST])) + 1e-6
+
+    def _finger_extended(self, points, tip_idx, pip_idx):
+        wrist = points[WRIST]
+        tip_dist = np.linalg.norm(points[tip_idx] - wrist)
+        pip_dist = np.linalg.norm(points[pip_idx] - wrist)
+        return tip_dist > pip_dist
+
+    def _finger_ups(self, points):
+        """État tendu/replié de chaque doigt, pouce inclus."""
+        return {
+            'thumb': self._finger_extended(points, THUMB_TIP, THUMB_IP),
+            'index': self._finger_extended(points, INDEX_TIP, INDEX_PIP),
+            'middle': self._finger_extended(points, MIDDLE_TIP, MIDDLE_PIP),
+            'ring': self._finger_extended(points, RING_TIP, RING_PIP),
+            'pinky': self._finger_extended(points, PINKY_TIP, PINKY_PIP),
+        }
+
+    def _exactly(self, f, up_names):
+        """Vrai si UNIQUEMENT les doigts de up_names sont tendus (parmi
+        les 5, pouce inclus), tous les autres repliés. Utilisé pour les
+        clics, où le pouce est le doigt actif ou doit être explicitement
+        replié pour éviter toute confusion."""
+        up_names = set(up_names)
+        for name in ('thumb', 'index', 'middle', 'ring', 'pinky'):
+            if f[name] != (name in up_names):
+                return False
+        return True
+
+    def is_pointer_pose(self, f):
+        """Index tendu, majeur replié (annulaire/auriculaire/pouce
+        ignorés) : déplace la souris. Ne dépend que d'index/majeur pour
+        rester fiable même si l'annulaire/auriculaire ne sont pas
+        parfaitement repliés (geste peu naturel à isoler)."""
+        return f['index'] and not f['middle']
+
+    def is_scroll_pose(self, f):
+        """Index ET majeur tendus (en V), peu importe annulaire/
+        auriculaire/pouce : scroll."""
+        return f['index'] and f['middle']
+
+    def is_left_click_pose(self, f):
+        """Pouce seul tendu : clic gauche."""
+        return self._exactly(f, {'thumb'})
+
+    def is_right_click_pose(self, f):
+        """Auriculaire seul tendu, pouce replié : clic droit."""
+        return self._exactly(f, {'pinky'})
+
+    def is_double_click_pose(self, f):
+        """Pouce + auriculaire tendus : double-clic."""
+        return self._exactly(f, {'thumb', 'pinky'})
+
+    def is_drag_pose(self, f):
+        """Majeur tendu, index replié (annulaire/auriculaire/pouce
+        ignorés) : glisser (drag)."""
+        return f['middle'] and not f['index']
+
+    def _is_oriented_up(self, points):
+        """True si le "V" du scroll pointe vers le haut de l'écran
+        (posture normale), False s'il pointe vers le bas (main inversée)."""
+        wrist_y = points[WRIST][1]
+        fingertip_y = (points[INDEX_TIP][1] + points[MIDDLE_TIP][1]) / 2.0
+        return fingertip_y < wrist_y  # y plus petit = plus haut à l'écran
+
+    def _recognize_scroll(self, points, f):
         """
-        Calcule la distance euclidienne entre deux points.
-        Chaque point est un tuple (x, y).
+        Renvoie (gesture, speed) :
+          - gesture : SCROLL_UP si le V pointe vers le haut, SCROLL_DOWN
+            s'il pointe vers le bas (recalculé à chaque frame), NONE hors
+            posture.
+          - speed : vitesse façon joystick : un point de référence est
+            fixé à l'entrée en posture ; plus tu t'éloignes verticalement
+            de ce point, plus la vitesse augmente ; revenir dessus la
+            ramène à la vitesse de base.
         """
+        if not self.is_scroll_pose(f):
+            self._scroll_anchor_y = None
+            self._scroll_speed_smooth = SCROLL_BASE_SPEED
+            return Gesture.NONE, 0.0
 
-        return math.hypot(
-    point2[0] - point1[0],
-    point2[1] - point1[1]
-)
+        current_y = points[MIDDLE_TIP][1]
 
-    def get_point(self, landmarks, index):
-        """
-        Récuperer les coordonnées d'un landmark
-        """
-        
-        lm = landmarks[index]
-        return (lm.x, lm.y)
-    
-    
-    
-    def _get_middle_delta(self, landmarks):
-        """
-        Pour trouver la distance entre la majeur de la frame precedente et de la frame actuelle
-        """
-        
-        middle_y = landmarks[12].y
+        if self._scroll_anchor_y is None:
+            self._scroll_anchor_y = current_y
 
-        if self.previous_middle_y is None:
-            self.previous_middle_y = middle_y
-            return 0
+        distance = abs(current_y - self._scroll_anchor_y)
 
-        delta = self.previous_middle_y - middle_y
-        self.previous_middle_y = middle_y
+        raw_speed = SCROLL_BASE_SPEED + SCROLL_DISTANCE_GAIN * distance
+        raw_speed = min(raw_speed, SCROLL_MAX_SPEED)
 
-        return delta
+        self._scroll_speed_smooth += SCROLL_SMOOTHING * (raw_speed - self._scroll_speed_smooth)
 
-    def is_left_click(self, landmarks):
-        """
-        Vérifie si le mouvement effectué est un click gauche (index-8 et pouche-4 suivant le seuil threshold )
-        """
-        thumb = self.get_point(landmarks, 4)
-        index = self.get_point(landmarks, 8)
+        gesture = Gesture.SCROLL_UP if self._is_oriented_up(points) else Gesture.SCROLL_DOWN
+        return gesture, self._scroll_speed_smooth
 
-        d = self.distance(thumb, index)
-
-        return d < self.click_threshold
-    
-
-    def is_right_click(self, landmarks):
-        """
-        Vérifie si le mouvement effectué est un click droit (index-8 et majeur-12 suivant le seuil threshold )
-        """
-        thumb = self.get_point(landmarks, 4)
-        middle = self.get_point(landmarks, 12)
-
-        d = self.distance(thumb, middle)
-
-        return d < self.click_threshold
-
-    def is_scroll_up(self, delta):
-        """
-        Vérifie si c'est un scroll up.
-        Calcule la distance entre le majeur de la frame précedente et celle de la frame actuelle.
-        Pour un scroll up, y_new < y_prev => y_new - y_prev < 0
-        """
-        
-        
-        return delta > self.scroll_threshold
-    
-    
-    def is_scroll_down(self , delta):
-        """
-        Vérifie si c'est un scroll down.
-        Calcule la distance entre le majeur de la frame précedente et celle de la frame actuelle.
-        Pour un scroll down, y_new > y_prev => y_new - y_prev > 0
-        """        
-        
-        return delta < -self.scroll_threshold
-
-
-    def _recognize_scroll(self, landmarks):
-        """
-        Fonction pour centraliser tous les types de scrolls (up ou Down)
-        """
-        
-
-        delta = self._get_middle_delta(landmarks)
-
-        if delta > self.scroll_threshold:
-            return Gesture.SCROLL_UP
-
-        if delta < -self.scroll_threshold:
-            return Gesture.SCROLL_DOWN
-
-        return Gesture.NONE
-    
-    
-    def is_drag(self , landmarks):
-        pass
-    
     def recognize(self, landmarks):
-
         """
-        Centraliser et detection du mouvement
+        Renvoie un tuple (gesture, moving_allowed, scroll_speed) :
+          - gesture : le geste détecté (Gesture.NONE si rien)
+          - moving_allowed : True si la main est en posture "déplacement"
+            (index seul) OU "drag" (majeur seul) : ce sont les deux seuls
+            gestes qui déplacent le curseur.
+          - scroll_speed : vitesse à appliquer si gesture est SCROLL_UP
+            ou SCROLL_DOWN (0.0 sinon).
         """
-        
         if landmarks is None:
-            return Gesture.NONE
+            self.reset()
+            return Gesture.NONE, False, 0.0
 
-        if self.is_left_click(landmarks):
-            return Gesture.LEFT_CLICK
+        points = self._to_points(landmarks)
+        f = self._finger_ups(points)
 
-        if self.is_right_click(landmarks):
-            return Gesture.RIGHT_CLICK
+        pointer_pose = self.is_pointer_pose(f)
+        drag_pose = self.is_drag_pose(f)
+        left_pose = self.is_left_click_pose(f)
+        right_pose = self.is_right_click_pose(f)
+        double_pose = self.is_double_click_pose(f)
 
-        scroll = self._recognize_scroll(landmarks)
+        moving_allowed = pointer_pose or drag_pose
 
-        if scroll != Gesture.NONE:
-            return scroll
+        # --- Confirmation sur plusieurs frames (anti-bruit) ---
+        self._left_streak = self._left_streak + 1 if left_pose else 0
+        self._right_streak = self._right_streak + 1 if right_pose else 0
+        self._double_streak = self._double_streak + 1 if double_pose else 0
+        self._drag_streak = self._drag_streak + 1 if drag_pose else 0
 
-        if self.is_drag(landmarks):
-            return Gesture.DRAG
+        # Ré-arme chaque clic dès que la posture correspondante est relâchée
+        if not left_pose:
+            self._left_armed = True
+        if not right_pose:
+            self._right_armed = True
+        if not double_pose:
+            self._double_armed = True
 
-        return Gesture.NONE
+        # Double-clic vérifié en premier (posture la plus spécifique)
+        if self._double_streak >= CONFIRM_FRAMES and self._double_armed:
+            self._double_armed = False
+            self._last_click_time = time.time()
+            return Gesture.DOUBLE_CLICK, moving_allowed, 0.0
+
+        if self._left_streak >= CONFIRM_FRAMES and self._left_armed:
+            self._left_armed = False
+            self._last_click_time = time.time()
+            return Gesture.LEFT_CLICK, moving_allowed, 0.0
+
+        if self._right_streak >= CONFIRM_FRAMES and self._right_armed:
+            self._right_armed = False
+            self._last_click_time = time.time()
+            return Gesture.RIGHT_CLICK, moving_allowed, 0.0
+
+        # Drag : continu tant que la posture est tenue (pas de "armed",
+        # on doit pouvoir glisser aussi longtemps qu'on garde le geste).
+        # Confirmation plus longue (DRAG_CONFIRM_FRAMES) pour laisser la
+        # posture se stabiliser, et bloqué juste après un clic (transition
+        # ambiguë entre postures) pour éviter un double-clic parasite qui
+        # ouvrirait le fichier/dossier juste avant que le drag démarre.
+        just_clicked = (time.time() - self._last_click_time) < DRAG_SUPPRESS_AFTER_CLICK
+        if self._drag_streak >= DRAG_CONFIRM_FRAMES and not just_clicked:
+            return Gesture.DRAG, moving_allowed, 0.0
+
+        scroll_gesture, scroll_speed = self._recognize_scroll(points, f)
+        if scroll_gesture != Gesture.NONE:
+            return scroll_gesture, moving_allowed, scroll_speed
+
+        return Gesture.NONE, moving_allowed, 0.0

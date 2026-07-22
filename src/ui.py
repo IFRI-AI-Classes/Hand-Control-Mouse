@@ -18,16 +18,43 @@ import cv2
 GESTURE_LABELS = {
     "NONE": "Aucune action",
     "LEFT_CLICK": "Clic gauche",
+    "DOUBLE_CLICK": "Double-clic",
     "RIGHT_CLICK": "Clic droit",
     "SCROLL_UP": "Scroll haut",
     "SCROLL_DOWN": "Scroll bas",
     "DRAG": "Glisser (drag)",
 }
 
+# Squelette standard des 21 landmarks MediaPipe (paires d'indices reliées
+# par un trait). Codé en dur ici pour ne pas dépendre de mediapipe dans
+# ce fichier, qui ne s'occupe que d'affichage.
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # pouce
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # majeur
+    (9, 13), (13, 14), (14, 15), (15, 16),   # annulaire
+    (13, 17), (17, 18), (18, 19), (19, 20),  # auriculaire
+    (0, 17),                                  # base de la paume
+]
+
 
 def label_for(gesture_name):
     """Renvoie le texte à afficher pour un nom de geste donné."""
     return GESTURE_LABELS.get(gesture_name, gesture_name)
+
+
+def draw_landmarks(frame, hand_landmarks):
+    """Dessine les 21 points de la main et le squelette qui les relie,
+    directement sur l'image (en pixels, à partir des coordonnées
+    normalisées 0-1 de MediaPipe)."""
+    h, w = frame.shape[:2]
+    points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, points[a], points[b], (0, 200, 0), 2)
+
+    for x, y in points:
+        cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
 
 
 class ActionOverlay:
@@ -93,11 +120,34 @@ class ActionOverlay:
             pass
 
 
-def show_debug_window(frame, gesture_name):
-    """Affiche la fenêtre webcam de debug avec le geste en cours dessus.
-    Renvoie False si l'utilisateur a appuyé sur 'q' (signal d'arrêt)."""
-    cv2.putText(frame, label_for(gesture_name), (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+def show_debug_window(frame, gesture_name, landmarks=None, fps=None):
+    """
+    Affiche la fenêtre webcam de debug avec :
+      - les landmarks de la main dessinés dessus (si détectée)
+      - un bandeau d'état : geste courant, main détectée ou non, FPS
+    Renvoie False si l'utilisateur a appuyé sur 'q' (signal d'arrêt).
+
+    landmarks : liste des 21 landmarks de la main (ou None si aucune main
+        détectée sur cette frame).
+    fps : nombre d'images par seconde à afficher (ou None pour ne pas
+        l'afficher).
+    """
+    if landmarks is not None:
+        draw_landmarks(frame, landmarks)
+
+    lines = [
+        label_for(gesture_name),
+        "Main détectée" if landmarks is not None else "Aucune main",
+    ]
+    if fps is not None:
+        lines.append(f"FPS: {fps:.0f}")
+
+    y = 35
+    for line in lines:
+        cv2.putText(frame, line, (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        y += 35
+
     cv2.imshow("Hand Control Mouse - DEBUG", frame)
     return (cv2.waitKey(1) & 0xFF) != ord('q')
 

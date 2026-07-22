@@ -81,63 +81,81 @@ class OneEuroFilter:
 class CoordinateMapper:
     """
     Convertit la position normalisée (0-1) d'un landmark MediaPipe en
-    position pixel sur l'écran, avec :
-      - une "zone active" réduite dans l'image webcam, pour pouvoir
-        atteindre les bords de l'écran sans avoir à mettre la main
-        tout au bord du champ de la caméra
-      - un lissage (One Euro Filter) appliqué séparément en x et en y
+    mouvement de curseur, façon PAVÉ TACTILE :
+      - le curseur avance de la même quantité que le doigt (mouvement
+        RELATIF), au lieu de sauter vers une position absolue à l'écran
+      - une zone morte ignore les micro-tremblements quand la main est
+        quasi immobile
+      - un lissage (One Euro Filter) est appliqué avant de calculer le
+        déplacement, pour un mouvement fluide
     """
 
-    def __init__(self, screen_w, screen_h, margin=0.15,
-                 min_cutoff=0.8, beta=0.4, freq=30.0):
+    def __init__(self, screen_w, screen_h,
+                 min_cutoff=0.4, beta=0.3, freq=30.0,
+                 sensitivity=2.5, deadzone=0.0008):
         """
         screen_w, screen_h : résolution de l'écran (pixels)
-        margin : fraction de l'image webcam ignorée sur chaque bord
-                 (0.15 -> on utilise la zone [0.15, 0.85] de l'image ;
-                 0 = pas de zone active, toute l'image est utilisée)
-        min_cutoff, beta : réglages du lissage
-            - min_cutoff plus bas => plus de lissage sur les mouvements lents
-            - beta plus élevé => réactivité plus forte sur les mouvements rapides
-        freq : fréquence approximative de la boucle (fps)
+        min_cutoff : plus bas => plus de lissage (moins de tremblement,
+                     un peu plus de latence). Monte-le si tu trouves le
+                     curseur trop "mou".
+        beta : réactivité sur les mouvements rapides. Descends-le si le
+               curseur est encore trop nerveux/sensible.
+        sensitivity : multiplicateur du déplacement (comme la sensibilité
+                      d'un pavé tactile). >1 = un petit geste déplace
+                      beaucoup le curseur ; <1 = il faut bouger plus la
+                      main pour un même déplacement à l'écran.
+        deadzone : en dessous de ce seuil (unité normalisée 0-1), un
+                   micro-mouvement est ignoré. Augmente-le si le curseur
+                   dérive tout seul quand ta main est immobile.
         """
         self.screen_w = screen_w
         self.screen_h = screen_h
-        self.margin = margin
+        self.sensitivity = sensitivity
+        self.deadzone = deadzone
 
         self.filter_x = OneEuroFilter(freq=freq, min_cutoff=min_cutoff, beta=beta)
         self.filter_y = OneEuroFilter(freq=freq, min_cutoff=min_cutoff, beta=beta)
 
-    def _apply_active_region(self, value):
-        """Étend la zone [margin, 1-margin] vers [0, 1], puis clamp."""
-        span = 1.0 - 2 * self.margin
-        if span <= 0:
-            return min(max(value, 0.0), 1.0)
-        value = (value - self.margin) / span
-        return min(max(value, 0.0), 1.0)
+        self._prev_x = None
+        self._prev_y = None
 
-    def to_screen(self, x_norm, y_norm):
+    def get_relative_move(self, x_norm, y_norm):
         """
         x_norm, y_norm : coordonnées normalisées (0-1) d'un landmark
         (typiquement le bout de l'index, landmark 8).
 
-        Renvoie (x, y) en pixels écran, lissés et prêts à être passés
-        à controller.py.
+        Renvoie (dx, dy) en pixels : le déplacement à appliquer au
+        curseur depuis sa position actuelle (comme un pavé tactile),
+        prêt à passer à controller.move_relative(dx, dy).
         """
-        x_active = self._apply_active_region(x_norm)
-        y_active = self._apply_active_region(y_norm)
-
-        x_screen = x_active * self.screen_w
-        y_screen = y_active * self.screen_h
-
         now = time.time()
-        x_smooth = self.filter_x.filter(x_screen, now)
-        y_smooth = self.filter_y.filter(y_screen, now)
+        x_smooth = self.filter_x.filter(x_norm, now)
+        y_smooth = self.filter_y.filter(y_norm, now)
 
-        return x_smooth, y_smooth
+        if self._prev_x is None:
+            self._prev_x, self._prev_y = x_smooth, y_smooth
+            return 0, 0
+
+        dx_norm = x_smooth - self._prev_x
+        dy_norm = y_smooth - self._prev_y
+
+        self._prev_x, self._prev_y = x_smooth, y_smooth
+
+        # Zone morte : ignore les micro-mouvements résiduels
+        if abs(dx_norm) < self.deadzone:
+            dx_norm = 0.0
+        if abs(dy_norm) < self.deadzone:
+            dy_norm = 0.0
+
+        dx = dx_norm * self.screen_w * self.sensitivity
+        dy = dy_norm * self.screen_h * self.sensitivity
+
+        return dx, dy
 
     def reset(self):
-        """À appeler quand la main disparaît, pour éviter un 'saut' du
-        curseur au prochain mouvement détecté (le filtre repart de zéro
-        plutôt que d'interpoler depuis une ancienne position)."""
+        """À appeler quand la main disparaît, pour repartir de zéro au
+        lieu de créer un grand saut au retour de la main."""
         self.filter_x.reset()
         self.filter_y.reset()
+        self._prev_x = None
+        self._prev_y = None
