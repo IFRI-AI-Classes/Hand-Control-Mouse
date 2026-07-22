@@ -3,13 +3,7 @@ C'est le fichier qui lance tout et qui fait le lien entre les autres.
 Il ne fait aucun calcul lui-même : il appelle juste, dans l'ordre,
 les fonctions des autres fichiers.
 
-Boucle principale : orchestre capture -> detection -> mapping -> gestures -> controller.
-"""
-
-"""
-C'est le fichier qui lance tout et qui fait le lien entre les autres.
-Il ne fait aucun calcul lui-même : il appelle juste, dans l'ordre,
-les fonctions des autres fichiers.
+Boucle principale : orchestre capture -> detection -> mapping -> gestures -> controller -> ui.
 """
 
 import cv2
@@ -20,6 +14,8 @@ from capture import open_camera, get_frame, release_camera
 from detection import HandDetector
 from gestures import GestureRecognizer, Gesture
 from controller import MouseController
+from mapping import CoordinateMapper
+from ui import ActionOverlay, show_debug_window, close_debug_window
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -37,6 +33,8 @@ def main():
     recognizer = GestureRecognizer()
     mouse = MouseController()
     screen_w, screen_h = pyautogui.size()
+    mapper = CoordinateMapper(screen_w, screen_h)
+    overlay = ActionOverlay()  # toujours actif, debug ou non
 
     try:
         while True:
@@ -53,10 +51,9 @@ def main():
             if landmarks:
                 hand = landmarks[0]  # on prend la première main détectée
 
-                # 3. Mapping brut (sans mapping.py pour l'instant)
+                # 3. Mapping (zone active + lissage) via mapping.py
                 index_tip = hand[8]
-                x = index_tip.x * screen_w
-                y = index_tip.y * screen_h
+                x, y = mapper.to_screen(index_tip.x, index_tip.y)
 
                 # 4. Déplacement du curseur
                 mouse.move(x, y)
@@ -69,14 +66,14 @@ def main():
 
             else:
                 gesture = Gesture.NONE
+                mapper.reset()  # évite un saut du curseur au retour de la main
 
-            # 7. Affichage debug (optionnel)
+            # 7. Affichage de l'action en cours (toujours actif)
+            overlay.update(gesture.name)
+
+            # 8. Fenêtre webcam de debug (optionnelle, --debug uniquement)
             if args.debug:
-                label = gesture.name if landmarks else "Aucune main"
-                cv2.putText(frame, label, (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.imshow("Hand Control Mouse - DEBUG", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if not show_debug_window(frame, gesture.name):
                     break
 
     except KeyboardInterrupt:
@@ -85,8 +82,9 @@ def main():
     finally:
         release_camera(cap)
         detector.close()
+        overlay.close()
         if args.debug:
-            cv2.destroyAllWindows()
+            close_debug_window()
 
 
 if __name__ == "__main__":
