@@ -21,10 +21,14 @@ GESTURE_LABELS = {
     "LEFT_CLICK": "Clic gauche",
     "DOUBLE_CLICK": "Double-clic",
     "RIGHT_CLICK": "Clic droit",
-    "SCROLL_UP": "Scroll haut",
-    "SCROLL_DOWN": "Scroll bas",
+    "SCROLL_UP": "Scroll haut ↑",
+    "SCROLL_DOWN": "Scroll bas ↓",
+    "SCROLL_READY": "Scroll : point neutre",
     "DRAG": "Glisser (drag)",
     "MOVE": "Déplacement",
+    "DRAG_PENDING": "Drag : confirmation...",
+    "DRAG_RELEASE": "Drag : relâchement...",
+    "DRAG": "Drag actif",
 }
 
 # Squelette standard des 21 landmarks MediaPipe (paires d'indices reliées

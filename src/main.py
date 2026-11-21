@@ -23,6 +23,10 @@ from ui import ActionOverlay, show_debug_window, close_debug_window
 # valeur à False (ou l'inverse) et reteste.
 MIRROR = True
 
+# Réglages du drag (glisser-déposer)
+DRAG_SPEED = 0.6    # 1.0 = même vitesse qu'en déplacement normal
+DRAG_SMOOTH = 0.5   # entre 0 et 1 : plus bas = plus doux, mais plus de retard
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -46,6 +50,9 @@ def main():
     # Suivi du FPS (lissé pour ne pas sauter dans tous les sens à l'affichage)
     prev_time = time.time()
     fps_smooth = 0.0
+
+    # Lissage du déplacement pendant un drag
+    smooth_dx = smooth_dy = 0.0
 
     try:
         while True:
@@ -79,29 +86,55 @@ def main():
                 #    le curseur, et à quelle vitesse scroller le cas échéant)
                 gesture, moving_allowed, scroll_speed = recognizer.recognize(hand)
 
-                # L'index levé n'est pas un "geste" pour le programme, mais on veut
-                # afficher qu'on est en déplacement
-                shown_name = "MOVE" if (gesture == Gesture.NONE and moving_allowed) else gesture.name
+                if gesture in (Gesture.LEFT_CLICK, Gesture.RIGHT_CLICK, Gesture.DOUBLE_CLICK):
+                    print(gesture.name, {k: int(v) for k, v in recognizer.last_fingers.items()},
+                        round(recognizer.last_thumb_ratio, 2))
 
-                # 4. Déplacement du curseur : suit le bout de l'index en
-                #    posture pointeur, ou le bout du majeur en posture
-                #    drag (c'est ce doigt-là qui est tendu dans ce cas).
+                # 4. Déplacement du curseur : suit la base de l'index en
+                #    posture pointeur, la base du majeur en posture drag
+                #    (y compris pendant la confirmation du drag).
                 if moving_allowed:
-                    # base du doigt : ne bouge pas quand le doigt se plie
-                    tracked_point = hand[9] if gesture == Gesture.DRAG else hand[5]
+                    in_drag = gesture == Gesture.DRAG or recognizer.drag_pending
+                    tracked_point = hand[9] if in_drag else hand[5]
                     dx, dy = mapper.get_relative_move(tracked_point.x, tracked_point.y)
-                    mouse.move_relative(dx, dy)
+                    frozen = recognizer.drag_pending or recognizer.drag_releasing
+
+                    if gesture == Gesture.DRAG:
+                        dx *= DRAG_SPEED
+                        dy *= DRAG_SPEED
+                        smooth_dx += DRAG_SMOOTH * (dx - smooth_dx)
+                        smooth_dy += DRAG_SMOOTH * (dy - smooth_dy)
+                        dx, dy = smooth_dx, smooth_dy
+                    else:
+                        smooth_dx = smooth_dy = 0.0
+
+                    if not frozen:
+                        mouse.move_relative(dx, dy)
                 else:
+                    smooth_dx = smooth_dy = 0.0
                     mapper.reset()
 
-                # 5. Action souris (clic, scroll à vitesse variable...)
+                # 5. Action souris (clic, drag, scroll à vitesse variable...)
                 mouse.handle(gesture, scroll_delta=scroll_speed)
+
+                # Nom affiché à l'écran
+                shown_name = gesture.name
+                if gesture == Gesture.NONE and moving_allowed:
+                    shown_name = "MOVE"
+                if gesture == Gesture.NONE and recognizer.scroll_ready:
+                    shown_name = "SCROLL_READY"
+                if recognizer.drag_pending:
+                    shown_name = "DRAG_PENDING"
+                elif recognizer.drag_releasing:
+                    shown_name = "DRAG_RELEASE"
 
             else:
                 gesture = Gesture.NONE
                 shown_name = "NONE"
-                mapper.reset()  # évite un saut du curseur au retour de la main
+                smooth_dx = smooth_dy = 0.0
+                mapper.reset()      # évite un saut du curseur au retour de la main
                 recognizer.reset()  # évite un faux scroll au retour de la main
+                mouse.handle(Gesture.NONE)  # relâche le bouton si un drag était en cours
 
             # 7. Affichage de l'action en cours (toujours actif)
             overlay.update(shown_name)
@@ -109,7 +142,7 @@ def main():
             # 8. Fenêtre webcam de debug (optionnelle, --debug uniquement)
             if args.debug:
                 displayed_hand = landmarks[0] if landmarks else None
-                if not show_debug_window(frame, gesture.name,
+                if not show_debug_window(frame, shown_name,
                                           landmarks=displayed_hand, fps=fps_smooth):
                     break
 
@@ -117,6 +150,7 @@ def main():
         pass
 
     finally:
+        mouse.release()
         release_camera(cap)
         detector.close()
         overlay.close()

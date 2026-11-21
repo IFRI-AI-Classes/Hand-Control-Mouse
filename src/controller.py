@@ -6,6 +6,7 @@ Tous les autres fichiers font juste des calculs, celui-ci agit pour de vrai.
 import pyautogui
 import time
 import sys
+import ctypes
 from gestures import Gesture
 
 # Par défaut, pyautogui attend 0.1s après CHAQUE appel (moveTo, click...).
@@ -24,6 +25,9 @@ class MouseController:
     def __init__(self):
         self.last_action_time = 0
         self.screen_w, self.screen_h = pyautogui.size()
+        self._button_down = False  # True si on est en train de glisser (drag)
+        self._rem_x = 0.0
+        self._rem_y = 0.0
 
     def _cooldown_ok(self):
         return time.time() - self.last_action_time > COOLDOWN
@@ -34,12 +38,27 @@ class MouseController:
     def move(self, x, y):
         # Déplacement absolu (curseur envoyé à une position précise).
         x, y = self._clamp(x, y)
-        pyautogui.moveTo(x, y)
+        self._move_to(x, y)
+
+    def _move_to(self, x, y):
+        # Pendant un drag sous Windows, il faut de vrais événements de
+        # mouvement : SetCursorPos (utilisé par pyautogui.moveTo) n'en
+        # génère pas, donc Windows ne voit pas le glisser avancer.
+        if sys.platform == "win32" and self._button_down:
+            ax = int(x * 65535 / (self.screen_w - 1))
+            ay = int(y * 65535 / (self.screen_h - 1))
+            ctypes.windll.user32.mouse_event(0x8001, ax, ay, 0, 0)  # MOVE | ABSOLUTE
+        else:
+            pyautogui.moveTo(x, y)
 
     def move_relative(self, dx, dy):
-        # Déplacement relatif, façon pavé tactile : le curseur avance de
-        # (dx, dy) par rapport à sa position actuelle.
-        if dx == 0 and dy == 0:
+        # On garde la fraction de pixel non utilisée pour l'image suivante :
+        # sans ça, les petits mouvements (< 1 px) seraient perdus.
+        dx += self._rem_x
+        dy += self._rem_y
+        ix, iy = round(dx), round(dy)
+        self._rem_x, self._rem_y = dx - ix, dy - iy
+        if ix == 0 and iy == 0:
             return
 
         try:
@@ -47,31 +66,23 @@ class MouseController:
         except Exception:
             return
 
-        target_x, target_y = self._clamp(current_x + dx, current_y + dy)
+        target_x, target_y = self._clamp(current_x + ix, current_y + iy)
 
         try:
-            pyautogui.moveTo(target_x, target_y)
+            self._move_to(target_x, target_y)
         except pyautogui.FailSafeException:
-            # Sécurité : on ne plante jamais, on ignore juste ce déplacement.
             pass
 
-    def _clamp(self, x, y):
-        """Empêche le curseur d'atteindre pile un coin de l'écran
-        (ce qui déclencherait le fail-safe de pyautogui)."""
-        x = max(SAFE_MARGIN, min(self.screen_w - SAFE_MARGIN, x))
-        y = max(SAFE_MARGIN, min(self.screen_h - SAFE_MARGIN, y))
-        return x, y
-
     def handle(self, gesture, scroll_delta=None):
-        # Reçoit un Gesture depuis gestures.py et exécute l'action
         if gesture == Gesture.DRAG:
-            pyautogui.mouseDown()
-            return  # rien d'autre à faire pendant un drag
+            if not self._button_down:
+                pyautogui.mouseDown()
+                self._button_down = True
+            return
 
-        # Dès qu'on n'est plus en train de glisser, on s'assure que le
-        # bouton est relâché - peu importe le geste qui suit (et pas
-        # seulement Gesture.NONE), pour ne jamais rester "collé".
-        pyautogui.mouseUp()
+        if self._button_down:
+            pyautogui.mouseUp()
+            self._button_down = False
 
         if gesture == Gesture.LEFT_CLICK and self._cooldown_ok():
             pyautogui.click()
@@ -92,3 +103,16 @@ class MouseController:
         elif gesture == Gesture.SCROLL_DOWN:
             speed = scroll_delta if scroll_delta else 3
             pyautogui.scroll(-int(round(speed * SCROLL_UNIT)))
+
+
+    def release(self):
+        if self._button_down:
+            pyautogui.mouseUp()
+            self._button_down = False
+    
+    def _clamp(self, x, y):
+            """Empêche le curseur d'atteindre pile un coin de l'écran
+            (ce qui déclencherait le fail-safe de pyautogui)."""
+            x = max(SAFE_MARGIN, min(self.screen_w - SAFE_MARGIN, x))
+            y = max(SAFE_MARGIN, min(self.screen_h - SAFE_MARGIN, y))
+            return x, y  

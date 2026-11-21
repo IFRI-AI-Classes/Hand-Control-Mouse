@@ -46,10 +46,10 @@ PINKY_TIP = 20
 INDEX_MCP = 5
 RING_MCP = 13
 PINKY_MCP = 17
-SCROLL_MIN_MOVE = 0.006   # mouvement minimal par frame pour scroller
-SCROLL_GAIN = 600         # sensibilité : mouvement -> vitesse
-SCROLL_VEL_SMOOTH = 0.5   # lissage du mouvement (0-1)
-SCROLL_NATUREL = True     # main qui monte = page qui descend (écran tactile)
+SCROLL_ARM_FRAMES = 5    # frames pour fixer le point neutre avant de pouvoir scroller
+SCROLL_DEADZONE = 0.03   # zone neutre autour du point de départ
+SCROLL_RANGE = 0.15      # écart à partir duquel on atteint la vitesse max
+SCROLL_NATUREL = True    # au-dessus du neutre = la page descend (écran tactile)
 # Un doigt est tendu si l'angle à son articulation du milieu dépasse ce seuil
 FINGER_EXTENDED_ANGLE = 140
 
@@ -63,6 +63,7 @@ CONFIRM_FRAMES = 3
 # passant d'une main neutre à "majeur seul tendu", plutôt que de capter
 # une configuration intermédiaire qui ressemble à un autre geste.
 DRAG_CONFIRM_FRAMES = 6
+DRAG_RELEASE_FRAMES = 5   # images sans posture drag tolérées avant de relâcher
 
 # Si un clic (simple, droit ou double) vient de se déclencher, on bloque
 # le démarrage d'un drag pendant ce délai : un vrai drag part d'une main
@@ -88,8 +89,9 @@ SCROLL_SMOOTHING = 0.3       # lissage (0-1) : plus haut = plus réactif, plus b
 class GestureRecognizer:
     def __init__(self):
         # État du "joystick" de scroll : point de référence et vitesse lissée
-        self._scroll_prev_y = None
-        self._scroll_vy = 0.0
+        self._scroll_anchor_y = None
+        self._scroll_arm = 0
+        self.scroll_ready = False
 
         # Compteurs de confirmation (anti-bruit) pour chaque geste "one-shot"
         self._left_streak = 0
@@ -108,10 +110,23 @@ class GestureRecognizer:
         self._last_click_time = 0.0
         self._last_open_hand_time = 0.0
 
+        self._dragging = False
+        self._drag_lost = 0
+
+    @property
+    def drag_pending(self):      # posture drag en cours de confirmation
+            return (not self._dragging) and self._drag_streak > 0
+
+    @property
+    def drag_releasing(self):    # drag actif, posture perdue depuis quelques images
+        return self._dragging and self._drag_lost > 0
+
     def reset(self):
         """À appeler quand la main disparaît de l'image, pour ne pas
         comparer avec une ancienne position au retour de la main."""
         self._scroll_anchor_y = None
+        self._scroll_arm = 0
+        self.scroll_ready = False
         self._scroll_speed_smooth = SCROLL_BASE_SPEED
         self._left_streak = 0
         self._right_streak = 0
@@ -121,6 +136,8 @@ class GestureRecognizer:
         self._right_armed = True
         self._double_armed = True
         self._last_click_time = 0.0
+        self._dragging = False
+        self._drag_lost = 0
 
     def _to_points(self, landmarks):
         return np.array([(lm.x, lm.y, lm.z) for lm in landmarks])
@@ -197,35 +214,49 @@ class GestureRecognizer:
 
     def _recognize_scroll(self, points, f):
         """
-        Comme sur un écran tactile : la main monte -> la page descend,
-        la main descend -> la page monte. Plus le mouvement est rapide,
-        plus ça scrolle vite. Main immobile = pas de scroll.
+        Une fois le V posé, le point où se trouve la main devient le point
+        neutre. Au-dessus : la page descend, en dessous : la page monte.
+        Plus on s'éloigne, plus ça va vite. Revenir au point neutre arrête
+        le scroll, sans quitter la posture.
         """
         if not self.is_scroll_pose(f):
-            self._scroll_prev_y = None
-            self._scroll_vy = 0.0
+            self._scroll_anchor_y = None
+            self._scroll_arm = 0
+            self.scroll_ready = False
             return Gesture.NONE, 0.0
 
-        y = (points[INDEX_TIP][1] + points[MIDDLE_TIP][1]) / 2  # bouts des doigts : plus sensible
-        if self._scroll_prev_y is None:
-            self._scroll_prev_y = y
+        self.scroll_ready = True
+        y = (points[INDEX_TIP][1] + points[MIDDLE_TIP][1]) / 2  # bouts des doigts
+
+        # Premières frames : le point neutre suit la main, pas de scroll
+        if self._scroll_arm < SCROLL_ARM_FRAMES:
+            self._scroll_arm += 1
+            self._scroll_anchor_y = y
             return Gesture.NONE, 0.0
 
-        dy = y - self._scroll_prev_y  # positif : main descendue
-        self._scroll_prev_y = y
-        self._scroll_vy += SCROLL_VEL_SMOOTH * (dy - self._scroll_vy)
-        print(f"{self._scroll_vy:+.4f}")   # <- la ligne à ajouter, avec la même indentation
-
-        if abs(self._scroll_vy) < SCROLL_MIN_MOVE:
+        d = self._scroll_anchor_y - y  # positif : main montée
+        dist = abs(d) - SCROLL_DEADZONE
+        if dist <= 0:
             return Gesture.NONE, 0.0
 
-        speed = SCROLL_BASE_SPEED + SCROLL_GAIN * (abs(self._scroll_vy) - SCROLL_MIN_MOVE)
-        speed = min(speed, SCROLL_MAX_SPEED)
+        t = min(dist / (SCROLL_RANGE - SCROLL_DEADZONE), 1.0)
+        speed = SCROLL_BASE_SPEED + (SCROLL_MAX_SPEED - SCROLL_BASE_SPEED) * t * t
 
-        main_descend = self._scroll_vy > 0
-        page_monte = main_descend if SCROLL_NATUREL else not main_descend
+        main_monte = d > 0
+        page_monte = (not main_monte) if SCROLL_NATUREL else main_monte
         gesture = Gesture.SCROLL_UP if page_monte else Gesture.SCROLL_DOWN
         return gesture, speed
+
+    def _update_drag(self, drag_pose):
+        just_clicked = (time.time() - self._last_click_time) < DRAG_SUPPRESS_AFTER_CLICK
+        if not self._dragging:
+            if self._drag_streak >= DRAG_CONFIRM_FRAMES and not just_clicked:
+                self._dragging = True
+                self._drag_lost = 0
+        else:
+            self._drag_lost = 0 if drag_pose else self._drag_lost + 1
+            if self._drag_lost > DRAG_RELEASE_FRAMES:
+                self._dragging = False
 
     def recognize(self, landmarks):
         """
@@ -243,6 +274,9 @@ class GestureRecognizer:
 
         points = self._to_points(landmarks)
         f = self._finger_ups(points)
+        self.last_fingers = f
+        scale = np.linalg.norm(points[MIDDLE_MCP] - points[WRIST]) + 1e-6
+        self.last_thumb_ratio = float(np.linalg.norm(points[THUMB_TIP] - points[INDEX_MCP]) / scale)
 
         if f['index'] and f['middle'] and f['ring'] and f['pinky']:
             self._last_open_hand_time = time.time()
@@ -275,6 +309,10 @@ class GestureRecognizer:
             self._right_armed = True
         if not double_pose:
             self._double_armed = True
+
+        self._update_drag(drag_pose)
+        if self._dragging:
+            return Gesture.DRAG, moving_allowed, 0.0
 
         # Double-clic vérifié en premier (posture la plus spécifique)
         if self._double_streak >= CONFIRM_FRAMES and self._double_armed:
