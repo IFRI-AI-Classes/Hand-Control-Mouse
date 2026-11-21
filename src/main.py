@@ -79,12 +79,17 @@ def main():
                 #    le curseur, et à quelle vitesse scroller le cas échéant)
                 gesture, moving_allowed, scroll_speed = recognizer.recognize(hand)
 
+                # L'index levé n'est pas un "geste" pour le programme, mais on veut
+                # afficher qu'on est en déplacement
+                shown_name = "MOVE" if (gesture == Gesture.NONE and moving_allowed) else gesture.name
+
                 # 4. Déplacement du curseur : suit le bout de l'index en
                 #    posture pointeur, ou le bout du majeur en posture
                 #    drag (c'est ce doigt-là qui est tendu dans ce cas).
                 if moving_allowed:
-                    tracked_tip = hand[12] if gesture == Gesture.DRAG else hand[8]
-                    dx, dy = mapper.get_relative_move(tracked_tip.x, tracked_tip.y)
+                    # base du doigt : ne bouge pas quand le doigt se plie
+                    tracked_point = hand[9] if gesture == Gesture.DRAG else hand[5]
+                    dx, dy = mapper.get_relative_move(tracked_point.x, tracked_point.y)
                     mouse.move_relative(dx, dy)
                 else:
                     mapper.reset()
@@ -94,11 +99,12 @@ def main():
 
             else:
                 gesture = Gesture.NONE
+                shown_name = "NONE"
                 mapper.reset()  # évite un saut du curseur au retour de la main
                 recognizer.reset()  # évite un faux scroll au retour de la main
 
             # 7. Affichage de l'action en cours (toujours actif)
-            overlay.update(gesture.name)
+            overlay.update(shown_name)
 
             # 8. Fenêtre webcam de debug (optionnelle, --debug uniquement)
             if args.debug:

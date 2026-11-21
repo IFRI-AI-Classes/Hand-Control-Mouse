@@ -5,6 +5,7 @@ Tous les autres fichiers font juste des calculs, celui-ci agit pour de vrai.
 """
 import pyautogui
 import time
+import sys
 from gestures import Gesture
 
 # Par défaut, pyautogui attend 0.1s après CHAQUE appel (moveTo, click...).
@@ -15,6 +16,9 @@ pyautogui.FAILSAFE = True  # garde la sécurité coin d'écran
 
 COOLDOWN = 0.5  # secondes entre deux actions
 SAFE_MARGIN = 3  # pixels de marge pour ne jamais toucher pile un coin
+# Windows : pyautogui compte le scroll en 1/120 de cran de molette.
+# Linux/Mac : en crans entiers. On convertit pour avoir un scroll utilisable.
+SCROLL_UNIT = 10 if sys.platform == "win32" else 0.1
 
 class MouseController:
     def __init__(self):
@@ -82,11 +86,9 @@ class MouseController:
             self._reset_cooldown()
 
         elif gesture == Gesture.SCROLL_UP:
-            # Pas de cooldown ici : le scroll doit être continu, avec une
-            # vitesse variable (scroll_delta), pas une impulsion isolée.
             speed = scroll_delta if scroll_delta else 3
-            pyautogui.scroll(int(round(speed)))
+            pyautogui.scroll(int(round(speed * SCROLL_UNIT)))
 
         elif gesture == Gesture.SCROLL_DOWN:
             speed = scroll_delta if scroll_delta else 3
-            pyautogui.scroll(-int(round(speed)))
+            pyautogui.scroll(-int(round(speed * SCROLL_UNIT)))

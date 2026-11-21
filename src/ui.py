@@ -10,6 +10,7 @@ Ne fait aucun calcul de position ni de geste.
 
 import threading
 import queue
+import time
 import tkinter as tk
 import cv2
 
@@ -23,6 +24,7 @@ GESTURE_LABELS = {
     "SCROLL_UP": "Scroll haut",
     "SCROLL_DOWN": "Scroll bas",
     "DRAG": "Glisser (drag)",
+    "MOVE": "Déplacement",
 }
 
 # Squelette standard des 21 landmarks MediaPipe (paires d'indices reliées
@@ -36,6 +38,10 @@ HAND_CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20),  # auriculaire
     (0, 17),                                  # base de la paume
 ]
+
+# Un clic ne dure qu'une frame : on garde son texte affiché un moment
+CLICK_NAMES = {"LEFT_CLICK", "RIGHT_CLICK", "DOUBLE_CLICK"}
+CLICK_DISPLAY_TIME = 0.6  # secondes
 
 
 def label_for(gesture_name):
@@ -66,8 +72,10 @@ class ActionOverlay:
     Tourne dans son propre thread pour ne jamais bloquer la boucle
     principale (capture/détection/souris).
     """
+    
 
     def __init__(self, x=20, y=20):
+        self._hold_until = 0.0
         self._queue = queue.Queue()
         self._x = x
         self._y = y
@@ -111,7 +119,12 @@ class ActionOverlay:
     def update(self, gesture_name):
         """À appeler depuis la boucle principale à chaque frame, avec le
         nom du geste courant (ex: 'LEFT_CLICK' ou 'NONE')."""
-        self._queue.put(label_for(gesture_name))
+        now = time.time()
+        if gesture_name in CLICK_NAMES:
+            self._hold_until = now + CLICK_DISPLAY_TIME
+            self._queue.put(label_for(gesture_name))
+        elif now >= self._hold_until:
+            self._queue.put(label_for(gesture_name))
 
     def close(self):
         try:

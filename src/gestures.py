@@ -43,6 +43,15 @@ RING_PIP = 14
 RING_TIP = 16
 PINKY_PIP = 18
 PINKY_TIP = 20
+INDEX_MCP = 5
+RING_MCP = 13
+PINKY_MCP = 17
+SCROLL_MIN_MOVE = 0.006   # mouvement minimal par frame pour scroller
+SCROLL_GAIN = 600         # sensibilité : mouvement -> vitesse
+SCROLL_VEL_SMOOTH = 0.5   # lissage du mouvement (0-1)
+SCROLL_NATUREL = True     # main qui monte = page qui descend (écran tactile)
+# Un doigt est tendu si l'angle à son articulation du milieu dépasse ce seuil
+FINGER_EXTENDED_ANGLE = 140
 
 # Nombre de frames consécutives où une posture doit être détectée avant
 # d'être validée. Filtre le bruit/tremblement de la détection (une seule
@@ -62,6 +71,13 @@ DRAG_CONFIRM_FRAMES = 6
 # dossier juste avant que le drag ne prenne le relais.
 DRAG_SUPPRESS_AFTER_CLICK = 0.4
 
+# Un clic doit être volontaire : la posture doit tenir ~0,25 s (7 frames)
+CLICK_CONFIRM_FRAMES = 7
+
+# Juste après une main ouverte, pas de clic : en refermant la main, le pouce
+# passe un instant en posture "clic"
+OPEN_HAND_SUPPRESS = 0.5
+
 # Vitesse de scroll, façon "manette/joystick" (voir _recognize_scroll)
 SCROLL_BASE_SPEED = 4        # vitesse minimale, main immobile sur le point de référence
 SCROLL_MAX_SPEED = 30        # vitesse plafond
@@ -72,8 +88,8 @@ SCROLL_SMOOTHING = 0.3       # lissage (0-1) : plus haut = plus réactif, plus b
 class GestureRecognizer:
     def __init__(self):
         # État du "joystick" de scroll : point de référence et vitesse lissée
-        self._scroll_anchor_y = None
-        self._scroll_speed_smooth = SCROLL_BASE_SPEED
+        self._scroll_prev_y = None
+        self._scroll_vy = 0.0
 
         # Compteurs de confirmation (anti-bruit) pour chaque geste "one-shot"
         self._left_streak = 0
@@ -90,6 +106,7 @@ class GestureRecognizer:
         # Horodatage du dernier clic déclenché, pour bloquer temporairement
         # le drag juste après (voir DRAG_SUPPRESS_AFTER_CLICK).
         self._last_click_time = 0.0
+        self._last_open_hand_time = 0.0
 
     def reset(self):
         """À appeler quand la main disparaît de l'image, pour ne pas
@@ -106,27 +123,37 @@ class GestureRecognizer:
         self._last_click_time = 0.0
 
     def _to_points(self, landmarks):
-        return np.array([(lm.x, lm.y) for lm in landmarks])
+        return np.array([(lm.x, lm.y, lm.z) for lm in landmarks])
 
     def _hand_scale(self, points):
         """Taille de référence de la main (poignet -> base du majeur)."""
         return float(np.linalg.norm(points[MIDDLE_MCP] - points[WRIST])) + 1e-6
 
-    def _finger_extended(self, points, tip_idx, pip_idx):
-        wrist = points[WRIST]
-        tip_dist = np.linalg.norm(points[tip_idx] - wrist)
-        pip_dist = np.linalg.norm(points[pip_idx] - wrist)
-        return tip_dist > pip_dist
+    def _angle(self, a, b, c):
+        """Angle en degrés au point b, entre les segments b->a et b->c."""
+        v1 = a - b
+        v2 = c - b
+        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+    def _finger_extended(self, points, mcp_idx, pip_idx, tip_idx):
+        angle = self._angle(points[mcp_idx], points[pip_idx], points[tip_idx])
+        return angle > FINGER_EXTENDED_ANGLE
 
     def _finger_ups(self, points):
         """État tendu/replié de chaque doigt, pouce inclus."""
         return {
-            'thumb': self._finger_extended(points, THUMB_TIP, THUMB_IP),
-            'index': self._finger_extended(points, INDEX_TIP, INDEX_PIP),
-            'middle': self._finger_extended(points, MIDDLE_TIP, MIDDLE_PIP),
-            'ring': self._finger_extended(points, RING_TIP, RING_PIP),
-            'pinky': self._finger_extended(points, PINKY_TIP, PINKY_PIP),
+        'thumb': self._thumb_extended(points),
+        'index': self._finger_extended(points, INDEX_MCP, INDEX_PIP, INDEX_TIP),
+        'middle': self._finger_extended(points, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP),
+        'ring': self._finger_extended(points, RING_MCP, RING_PIP, RING_TIP),
+        'pinky': self._finger_extended(points, PINKY_MCP, PINKY_PIP, PINKY_TIP),
         }
+
+    def _thumb_extended(self, points):
+    # Le pouce garde l'ancienne règle (distance au poignet) pour l'instant
+        wrist = points[WRIST]
+        return np.linalg.norm(points[THUMB_TIP] - wrist) > np.linalg.norm(points[THUMB_IP] - wrist)
 
     def _exactly(self, f, up_names):
         """Vrai si UNIQUEMENT les doigts de up_names sont tendus (parmi
@@ -147,9 +174,9 @@ class GestureRecognizer:
         return f['index'] and not f['middle']
 
     def is_scroll_pose(self, f):
-        """Index ET majeur tendus (en V), peu importe annulaire/
-        auriculaire/pouce : scroll."""
-        return f['index'] and f['middle']
+        """Index et majeur tendus (V), annulaire et auriculaire repliés :
+        scroll. La main ouverte n'en est plus un."""
+        return f['index'] and f['middle'] and not f['ring'] and not f['pinky']
 
     def is_left_click_pose(self, f):
         """Pouce seul tendu : clic gauche."""
@@ -168,43 +195,37 @@ class GestureRecognizer:
         ignorés) : glisser (drag)."""
         return f['middle'] and not f['index']
 
-    def _is_oriented_up(self, points):
-        """True si le "V" du scroll pointe vers le haut de l'écran
-        (posture normale), False s'il pointe vers le bas (main inversée)."""
-        wrist_y = points[WRIST][1]
-        fingertip_y = (points[INDEX_TIP][1] + points[MIDDLE_TIP][1]) / 2.0
-        return fingertip_y < wrist_y  # y plus petit = plus haut à l'écran
-
     def _recognize_scroll(self, points, f):
         """
-        Renvoie (gesture, speed) :
-          - gesture : SCROLL_UP si le V pointe vers le haut, SCROLL_DOWN
-            s'il pointe vers le bas (recalculé à chaque frame), NONE hors
-            posture.
-          - speed : vitesse façon joystick : un point de référence est
-            fixé à l'entrée en posture ; plus tu t'éloignes verticalement
-            de ce point, plus la vitesse augmente ; revenir dessus la
-            ramène à la vitesse de base.
+        Comme sur un écran tactile : la main monte -> la page descend,
+        la main descend -> la page monte. Plus le mouvement est rapide,
+        plus ça scrolle vite. Main immobile = pas de scroll.
         """
         if not self.is_scroll_pose(f):
-            self._scroll_anchor_y = None
-            self._scroll_speed_smooth = SCROLL_BASE_SPEED
+            self._scroll_prev_y = None
+            self._scroll_vy = 0.0
             return Gesture.NONE, 0.0
 
-        current_y = points[MIDDLE_TIP][1]
+        y = (points[INDEX_TIP][1] + points[MIDDLE_TIP][1]) / 2  # bouts des doigts : plus sensible
+        if self._scroll_prev_y is None:
+            self._scroll_prev_y = y
+            return Gesture.NONE, 0.0
 
-        if self._scroll_anchor_y is None:
-            self._scroll_anchor_y = current_y
+        dy = y - self._scroll_prev_y  # positif : main descendue
+        self._scroll_prev_y = y
+        self._scroll_vy += SCROLL_VEL_SMOOTH * (dy - self._scroll_vy)
+        print(f"{self._scroll_vy:+.4f}")   # <- la ligne à ajouter, avec la même indentation
 
-        distance = abs(current_y - self._scroll_anchor_y)
+        if abs(self._scroll_vy) < SCROLL_MIN_MOVE:
+            return Gesture.NONE, 0.0
 
-        raw_speed = SCROLL_BASE_SPEED + SCROLL_DISTANCE_GAIN * distance
-        raw_speed = min(raw_speed, SCROLL_MAX_SPEED)
+        speed = SCROLL_BASE_SPEED + SCROLL_GAIN * (abs(self._scroll_vy) - SCROLL_MIN_MOVE)
+        speed = min(speed, SCROLL_MAX_SPEED)
 
-        self._scroll_speed_smooth += SCROLL_SMOOTHING * (raw_speed - self._scroll_speed_smooth)
-
-        gesture = Gesture.SCROLL_UP if self._is_oriented_up(points) else Gesture.SCROLL_DOWN
-        return gesture, self._scroll_speed_smooth
+        main_descend = self._scroll_vy > 0
+        page_monte = main_descend if SCROLL_NATUREL else not main_descend
+        gesture = Gesture.SCROLL_UP if page_monte else Gesture.SCROLL_DOWN
+        return gesture, speed
 
     def recognize(self, landmarks):
         """
@@ -222,6 +243,16 @@ class GestureRecognizer:
 
         points = self._to_points(landmarks)
         f = self._finger_ups(points)
+
+        if f['index'] and f['middle'] and f['ring'] and f['pinky']:
+            self._last_open_hand_time = time.time()
+
+        # On vient de refermer la main : un "pouce seul" maintenant est un passage,
+# pas un clic. Il faut relâcher avant de pouvoir recliquer.
+        if time.time() - self._last_open_hand_time < OPEN_HAND_SUPPRESS:
+            self._left_armed = False
+            self._right_armed = False
+            self._double_armed = False
 
         pointer_pose = self.is_pointer_pose(f)
         drag_pose = self.is_drag_pose(f)
