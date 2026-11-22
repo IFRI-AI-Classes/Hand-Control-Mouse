@@ -1,0 +1,7 @@
+gesture,images,detection,regles_sur_mains_detectees,regles_bout_en_bout
+clic_droit,321,0.972,0.51,0.495
+clic_gauche,444,0.984,0.819,0.806
+deplacement,298,1.0,0.977,0.977
+drag,363,0.964,0.849,0.818
+neutre,240,0.992,0.958,0.95
+scroll,360,0.978,0.997,0.975

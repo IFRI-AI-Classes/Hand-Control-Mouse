@@ -1,0 +1,10 @@
+methode,f1_temporel,f1_test_sur_freud,f1_test_sur_prince,photos_correctes
+regles,0.848,0.842,0.768,4/5
+logreg,0.931,0.318,0.447,1/5
+logreg+aug,0.937,0.3,0.542,0/5
+knn,0.961,0.248,0.454,1/5
+knn+aug,0.975,0.325,0.458,0/5
+random_forest,0.979,0.388,0.456,0/5
+random_forest+aug,0.971,0.462,0.517,0/5
+mlp,0.945,0.167,0.434,0/5
+mlp+aug,0.978,0.306,0.487,0/5
