@@ -7,6 +7,7 @@ Boucle principale : orchestre capture -> detection -> mapping -> gestures -> con
 """
 
 import cv2
+import math
 import time
 import argparse
 import pyautogui
@@ -26,6 +27,25 @@ MIRROR = True
 # Réglages du drag (glisser-déposer)
 DRAG_SPEED = 0.6    # 1.0 = même vitesse qu'en déplacement normal
 DRAG_SMOOTH = 0.5   # entre 0 et 1 : plus bas = plus doux, mais plus de retard
+
+# Accélération du curseur en déplacement normal : lent = précis, rapide = grande
+# portée. La vitesse est mesurée en pixels par image avant accélération.
+ACCEL_V_LOW = 3.0        # en dessous : gain minimal
+ACCEL_V_HIGH = 40.0      # au dessus : gain maximal
+ACCEL_GAIN_LOW = 0.6
+ACCEL_GAIN_HIGH = 1.6
+SENS_Y = 1.25            # la main bouge moins en vertical qu'en horizontal
+
+# Passe à True pour afficher chaque clic détecté avec l'état des doigts
+# (1 = tendu, 0 = replié) et la mesure du pouce. Utile pour régler les seuils.
+DEBUG_CLICKS = False
+
+
+def accelerate(dx, dy):
+    v = math.hypot(dx, dy)
+    t = min(max((v - ACCEL_V_LOW) / (ACCEL_V_HIGH - ACCEL_V_LOW), 0.0), 1.0)
+    gain = ACCEL_GAIN_LOW + (ACCEL_GAIN_HIGH - ACCEL_GAIN_LOW) * t
+    return dx * gain, dy * gain * SENS_Y
 
 
 def parse_args():
@@ -61,9 +81,7 @@ def main():
             if frame is None:
                 continue
 
-            # Effet miroir : la webcam nous voit "en face", donc sans ce
-            # flip, un mouvement vers la droite du doigt peut partir vers
-            # la gauche dans l'image. Réglable via MIRROR en haut du fichier.
+            # Effet miroir (voir MIRROR en haut du fichier)
             if MIRROR:
                 frame = cv2.flip(frame, 1)
 
@@ -82,13 +100,14 @@ def main():
             if landmarks:
                 hand = landmarks[0]  # on prend la première main détectée
 
-                # 3. Reconnaissance du geste (dit aussi si on peut bouger
-                #    le curseur, et à quelle vitesse scroller le cas échéant)
+                # 3. Reconnaissance du geste
                 gesture, moving_allowed, scroll_speed = recognizer.recognize(hand)
 
-                if gesture in (Gesture.LEFT_CLICK, Gesture.RIGHT_CLICK, Gesture.DOUBLE_CLICK):
-                    print(gesture.name, {k: int(v) for k, v in recognizer.last_fingers.items()},
-                        round(recognizer.last_thumb_ratio, 2))
+                if DEBUG_CLICKS and gesture in (Gesture.LEFT_CLICK, Gesture.RIGHT_CLICK,
+                                                Gesture.DOUBLE_CLICK):
+                    print(gesture.name,
+                          {k: int(v) for k, v in recognizer.last_fingers.items()},
+                          round(recognizer.last_thumb_ratio, 2))
 
                 # 4. Déplacement du curseur : suit la base de l'index en
                 #    posture pointeur, la base du majeur en posture drag
@@ -101,11 +120,12 @@ def main():
 
                     if gesture == Gesture.DRAG:
                         dx *= DRAG_SPEED
-                        dy *= DRAG_SPEED
+                        dy *= DRAG_SPEED * SENS_Y
                         smooth_dx += DRAG_SMOOTH * (dx - smooth_dx)
                         smooth_dy += DRAG_SMOOTH * (dy - smooth_dy)
                         dx, dy = smooth_dx, smooth_dy
                     else:
+                        dx, dy = accelerate(dx, dy)
                         smooth_dx = smooth_dy = 0.0
 
                     if not frozen:
@@ -121,6 +141,8 @@ def main():
                 shown_name = gesture.name
                 if gesture == Gesture.NONE and moving_allowed:
                     shown_name = "MOVE"
+                if gesture == Gesture.NONE and recognizer.open_hand:
+                    shown_name = "CLUTCH"
                 if gesture == Gesture.NONE and recognizer.scroll_ready:
                     shown_name = "SCROLL_READY"
                 if recognizer.drag_pending:

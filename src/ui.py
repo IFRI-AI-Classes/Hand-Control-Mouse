@@ -29,6 +29,7 @@ GESTURE_LABELS = {
     "DRAG_PENDING": "Drag : confirmation...",
     "DRAG_RELEASE": "Drag : relâchement...",
     "DRAG": "Drag actif",
+    "CLUTCH": "Main ouverte : repositionnement",
 }
 
 # Squelette standard des 21 landmarks MediaPipe (paires d'indices reliées
