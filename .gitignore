@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Données du MLP (trop lourdes pour git)
+data/landmarks/*.csv
