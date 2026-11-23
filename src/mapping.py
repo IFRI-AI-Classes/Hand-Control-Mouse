@@ -92,7 +92,8 @@ class CoordinateMapper:
 
     def __init__(self, screen_w, screen_h,
                  min_cutoff=0.4, beta=0.3, freq=30.0,
-                 sensitivity=2.5, deadzone=0.0008):
+                 sensitivity=2.5, deadzone=0.0008,
+                 filter_mode="oneeuro", ema_alpha=0.4):
         """
         screen_w, screen_h : résolution de l'écran (pixels)
         min_cutoff : plus bas => plus de lissage (moins de tremblement,
@@ -113,6 +114,20 @@ class CoordinateMapper:
         self.sensitivity = sensitivity
         self.deadzone = deadzone
 
+        # Mode de lissage (utile pour comparer les filtres, objectif 1) :
+        #   "oneeuro" : filtre One Euro (par défaut)
+        #   "ema"     : moyenne mobile exponentielle (ema_alpha : 0-1, plus
+        #               haut = plus réactif)
+        #   "none"    : aucun lissage
+        self.filter_mode = filter_mode
+        self.ema_alpha = ema_alpha
+        self._ema_x = None
+        self._ema_y = None
+
+        # Dernières valeurs, lues par main.py pour le journal de mesures
+        self.last_raw = (None, None)
+        self.last_smooth = (None, None)
+
         self.filter_x = OneEuroFilter(freq=freq, min_cutoff=min_cutoff, beta=beta)
         self.filter_y = OneEuroFilter(freq=freq, min_cutoff=min_cutoff, beta=beta)
 
@@ -129,8 +144,22 @@ class CoordinateMapper:
         prêt à passer à controller.move_relative(dx, dy).
         """
         now = time.time()
-        x_smooth = self.filter_x.filter(x_norm, now)
-        y_smooth = self.filter_y.filter(y_norm, now)
+        if self.filter_mode == "none":
+            x_smooth, y_smooth = x_norm, y_norm
+        elif self.filter_mode == "ema":
+            if self._ema_x is None:
+                self._ema_x, self._ema_y = x_norm, y_norm
+            else:
+                a = self.ema_alpha
+                self._ema_x = a * x_norm + (1 - a) * self._ema_x
+                self._ema_y = a * y_norm + (1 - a) * self._ema_y
+            x_smooth, y_smooth = self._ema_x, self._ema_y
+        else:
+            x_smooth = self.filter_x.filter(x_norm, now)
+            y_smooth = self.filter_y.filter(y_norm, now)
+
+        self.last_raw = (x_norm, y_norm)
+        self.last_smooth = (x_smooth, y_smooth)
 
         if self._prev_x is None:
             self._prev_x, self._prev_y = x_smooth, y_smooth
@@ -157,5 +186,7 @@ class CoordinateMapper:
         lieu de créer un grand saut au retour de la main."""
         self.filter_x.reset()
         self.filter_y.reset()
+        self._ema_x = None
+        self._ema_y = None
         self._prev_x = None
         self._prev_y = None

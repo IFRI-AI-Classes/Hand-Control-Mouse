@@ -6,6 +6,7 @@ les fonctions des autres fichiers.
 Boucle principale : orchestre capture -> detection -> mapping -> gestures -> controller -> ui.
 """
 
+import csv
 import cv2
 import math
 import time
@@ -52,6 +53,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true",
                         help="Affiche la fenêtre de visualisation")
+    parser.add_argument("--log", metavar="FICHIER.csv",
+                        help="Enregistre une ligne par image (mesures objectif 1)")
+    parser.add_argument("--filter", choices=["none", "ema", "oneeuro"], default="oneeuro",
+                        help="Lissage du curseur (défaut : oneeuro)")
+    parser.add_argument("--min-cutoff", type=float, default=0.4,
+                        help="One Euro : plus bas = plus de lissage (défaut 0.4)")
+    parser.add_argument("--beta", type=float, default=0.3,
+                        help="One Euro : réactivité aux mouvements rapides (défaut 0.3)")
     return parser.parse_args()
 
 
@@ -64,7 +73,9 @@ def main():
     recognizer = GestureRecognizer()
     mouse = MouseController()
     screen_w, screen_h = pyautogui.size()
-    mapper = CoordinateMapper(screen_w, screen_h)
+    mapper = CoordinateMapper(screen_w, screen_h,
+                              min_cutoff=args.min_cutoff, beta=args.beta,
+                              filter_mode=args.filter)
     overlay = ActionOverlay()  # toujours actif, debug ou non
 
     # Suivi du FPS (lissé pour ne pas sauter dans tous les sens à l'affichage)
@@ -74,12 +85,26 @@ def main():
     # Lissage du déplacement pendant un drag
     smooth_dx = smooth_dy = 0.0
 
+    # Journal de mesures (une ligne par image), voir --log
+    log_file = log_writer = None
+    t_start = time.perf_counter()
+    if args.log:
+        log_file = open(args.log, "w", newline="", encoding="utf-8")
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(["t_s", "dt_ms", "fps", "hand", "gesture",
+                             "raw_x", "raw_y", "sm_x", "sm_y", "dx", "dy",
+                             "cursor_x", "cursor_y", "detect_ms", "total_ms"])
+
     try:
         while True:
             # 1. Capture
             frame = get_frame(cap)
             if frame is None:
                 continue
+            t_frame = time.perf_counter()
+            hand_present = 0
+            raw_x = raw_y = sm_x = sm_y = ""
+            log_dx = log_dy = 0.0
 
             # Effet miroir (voir MIRROR en haut du fichier)
             if MIRROR:
@@ -88,6 +113,7 @@ def main():
             # 2. Détection (synchrone, résultat immédiat pour cette frame)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             landmarks = detector.detect(rgb_frame)
+            t_detect = time.perf_counter()
 
             # Calcul du FPS (lissage exponentiel pour un affichage stable)
             now = time.time()
@@ -98,6 +124,7 @@ def main():
                 fps_smooth = instant_fps if fps_smooth == 0 else fps_smooth * 0.9 + instant_fps * 0.1
 
             if landmarks:
+                hand_present = 1
                 hand = landmarks[0]  # on prend la première main détectée
 
                 # 3. Reconnaissance du geste
@@ -117,6 +144,8 @@ def main():
                     tracked_point = hand[9] if in_drag else hand[5]
                     dx, dy = mapper.get_relative_move(tracked_point.x, tracked_point.y)
                     frozen = recognizer.drag_pending or recognizer.drag_releasing
+                    raw_x, raw_y = mapper.last_raw
+                    sm_x, sm_y = mapper.last_smooth
 
                     if gesture == Gesture.DRAG:
                         dx *= DRAG_SPEED
@@ -129,6 +158,7 @@ def main():
                         smooth_dx = smooth_dy = 0.0
 
                     if not frozen:
+                        log_dx, log_dy = dx, dy
                         mouse.move_relative(dx, dy)
                 else:
                     smooth_dx = smooth_dy = 0.0
@@ -158,6 +188,19 @@ def main():
                 recognizer.reset()  # évite un faux scroll au retour de la main
                 mouse.handle(Gesture.NONE)  # relâche le bouton si un drag était en cours
 
+            # Fin du traitement : on mesure ici, avant l'affichage
+            t_action = time.perf_counter()
+            if log_writer:
+                cx, cy = pyautogui.position()
+                fmt = lambda v: "" if v == "" or v is None else round(v, 6)
+                log_writer.writerow([
+                    round(t_frame - t_start, 4), round(dt * 1000, 2),
+                    round(fps_smooth, 2), hand_present, shown_name,
+                    fmt(raw_x), fmt(raw_y), fmt(sm_x), fmt(sm_y),
+                    round(log_dx, 2), round(log_dy, 2), cx, cy,
+                    round((t_detect - t_frame) * 1000, 2),
+                    round((t_action - t_frame) * 1000, 2)])
+
             # 7. Affichage de l'action en cours (toujours actif)
             overlay.update(shown_name)
 
@@ -172,6 +215,8 @@ def main():
         pass
 
     finally:
+        if log_file:
+            log_file.close()
         mouse.release()
         release_camera(cap)
         detector.close()
