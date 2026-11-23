@@ -59,7 +59,7 @@ def parse_args():
                         help="Lissage du curseur (défaut : oneeuro)")
     parser.add_argument("--min-cutoff", type=float, default=0.4,
                         help="One Euro : plus bas = plus de lissage (défaut 0.4)")
-    parser.add_argument("--beta", type=float, default=0.3,
+    parser.add_argument("--beta", type=float, default=5.0,
                         help="One Euro : réactivité aux mouvements rapides (défaut 0.3)")
     return parser.parse_args()
 
